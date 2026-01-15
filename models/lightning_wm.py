@@ -124,15 +124,15 @@ class LightningWM(pl.LightningModule):
         K = self.state_encoder.num_queries
         tubelet_size = self.state_encoder.tubelet_size
         
-        input_video = video[:, :-tubelet_size].contiguous() # (B, N*tubelet_size, C, H, W)
-        target_video = video[:, tubelet_size:].contiguous() # (B, N*tubelet_size, C, H, W)
-        input_proprios = proprios[:, :-tubelet_size].contiguous() # (B, N*tubelet_size, P)
-        target_proprios = proprios[:, tubelet_size:].contiguous() # (B, N*tubelet_size, P)
+        input_video = video[:, :-tubelet_size] # (B, N*tubelet_size, C, H, W)
+        target_video = video[:, tubelet_size:] # (B, N*tubelet_size, C, H, W)
+        input_proprios = proprios[:, :-tubelet_size] # (B, N*tubelet_size, P)
+        target_proprios = proprios[:, tubelet_size:] # (B, N*tubelet_size, P)
 
-        input_video = input_video.view(B * N, tubelet_size, C, H, W)  # (B*N, tubelet_size, C, H, W)
-        input_proprios = input_proprios.view(B * N, tubelet_size, proprios.size(-1))  # (B*N, tubelet_size, P)
-        target_video = target_video.view(B * N, tubelet_size, C, H, W)  # (B*N, tubelet_size, C, H, W)
-        target_proprios = target_proprios.view(B * N, tubelet_size, proprios.size(-1))  # (B*N, tubelet_size, P)
+        input_video = input_video.reshape(B * N, tubelet_size, C, H, W)  # (B*N, tubelet_size, C, H, W)
+        input_proprios = input_proprios.reshape(B * N, tubelet_size, proprios.size(-1))  # (B*N, tubelet_size, P)
+        target_video = target_video.reshape(B * N, tubelet_size, C, H, W)  # (B*N, tubelet_size, C, H, W)
+        target_proprios = target_proprios.reshape(B * N, tubelet_size, proprios.size(-1))  # (B*N, tubelet_size, P)
 
         # Encode input
         input_embeds = self.state_encoder(input_video, input_proprios) # (B*N, K, D)
