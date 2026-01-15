@@ -12,7 +12,7 @@ class LightningWM(pl.LightningModule):
     def __init__(
         self,
         # State Encoder params
-        image_size: tuple[int, int] = (384, 384),
+        image_size: tuple[int, int] = (256, 256),
         tubelet_size: int = 2,
         image_backbone: str = "resnet50",
         pretrained: bool = False,

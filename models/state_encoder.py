@@ -4,6 +4,7 @@ import math
 
 from models.derf import Dynamic_erf
 from models.modules import AttentionBlock, CrossAttentionBlock
+from models.modules import precompute_freqs
 from timm.layers import trunc_normal_
 from timm import create_model
 
@@ -14,7 +15,7 @@ class StateEncoder(nn.Module):
     """
     def __init__(
         self,
-        image_size: tuple[int, int] = (384, 384),
+        image_size: tuple[int, int] = (256, 256),
         tubelet_size: int = 2,
         image_backbone: str = "resnet50", # supported by timm
         pretrained: bool = False,
@@ -61,14 +62,14 @@ class StateEncoder(nn.Module):
         self.image_proj = nn.Linear(self.image_emb_dim, emb_dim)
         self.proprio_proj = nn.Linear(proprio_dim, emb_dim)
 
-        self.register_buffer('patch_pos_embed', self._create_3d_fourier_pos(emb_dim))
-        self.register_buffer('proprio_pos_embed', self._create_1d_temporal_pos(emb_dim))
+        norm_layer = Dynamic_erf if use_derf else nn.RMSNorm
         
         # Attention pooling layers
         self.pooling_layers = nn.ModuleList([
             StatePoolerLayer(
                 emb_dim,
                 num_heads,
+                num_queries=num_queries,
                 num_cross_blocks=num_cross_blocks_per_layer,
                 mlp_ratio=mlp_ratio,
                 qkv_bias=qkv_bias,
@@ -77,10 +78,16 @@ class StateEncoder(nn.Module):
                 drop_path=dpr[i],
                 act_layer=nn.SiLU if use_silu else nn.GELU,
                 wide_silu=wide_silu,
-                norm_layer=Dynamic_erf if use_derf else nn.RMSNorm,
+                norm_layer=norm_layer,
             )
             for i in range(depth)
         ])
+
+        self.final_norm = norm_layer(emb_dim)
+
+        # Positional embeddings
+        self.register_buffer('patch_pos_embed', self._create_3d_fourier_pos(emb_dim)) # (T*H*W, emb_dim)
+        self.register_buffer('proprio_pos_embed', self._create_1d_temporal_pos(emb_dim)) # (T, emb_dim)
         
         self.init_std = init_std
         trunc_normal_(self.query_tokens, std=self.init_std)
@@ -221,6 +228,7 @@ class StateEncoder(nn.Module):
         for layer in self.pooling_layers:
             queries = layer(queries, c)
         
+        queries = self.final_norm(queries)
         return queries
 
 
@@ -229,6 +237,7 @@ class StatePoolerLayer(nn.Module):
         self,
         emb_dim, 
         num_heads, 
+        num_queries=64,
         num_cross_blocks=3,
         mlp_ratio=4.0,
         qkv_bias=True,
@@ -271,14 +280,18 @@ class StatePoolerLayer(nn.Module):
                 wide_silu=wide_silu,
                 norm_layer=norm_layer,
             )
+
+            coords = torch.arange(num_queries)
+            freqs = precompute_freqs(emb_dim // num_heads, coords)
+            self.register_buffer('freqs', freqs) # (2, num_queries, head_dim)
+
         else:
             self.attn_block = nn.Identity()
 
-        self.final_norm = norm_layer(emb_dim)
 
     def forward(self, latent: torch.Tensor, context: torch.Tensor) -> torch.Tensor:
         for cross_block in self.cross_blocks:
             latent = cross_block(latent, context)
-        latent = self.attn_block(latent)
-
-        return self.final_norm(latent)
+        if self.use_self_attn:
+            latent = self.attn_block(latent, self.freqs)
+        return latent

@@ -127,7 +127,7 @@ class SwiGLUFFN(nn.Module):
 
 class PoPE2DAttention(nn.Module):
     """
-    Polar Coordinate Positional Embedding (PoPE) Attention Module
+    Polar Coordinate Positional Embedding (PoPE) 2D Attention Module
     
     Args:
         dim: Dimension of the input features
@@ -214,6 +214,7 @@ class PoPE2DAttention(nn.Module):
         q_combined = torch.cat([q_real, q_imag], dim=-1) # Shape: (b, h, q, 2d)
         k_combined = torch.cat([k_real, k_imag], dim=-1) # Shape: (b, h, k, 2d)
         scores = torch.matmul(q_combined, k_combined.transpose(-1, -2))
+        
         scores = scores / math.sqrt(self.head_dim)
 
         # Apply custom mask if provided
@@ -288,7 +289,19 @@ class ACBlock(nn.Module):
     
 
 
-class Attention(nn.Module):
+class PoPEAttention(nn.Module):
+    """
+    Polar Coordinate Positional Embedding (PoPE) Attention Module
+    
+    Args:
+        dim: Dimension of the input features
+        num_heads: Number of attention heads
+        qkv_bias: If True, add bias to QKV projections
+        attn_drop: Dropout rate for attention weights
+        proj_drop: Dropout rate for output projection
+        is_causal: If True, apply causal masking for autoregressive tasks
+    """
+    
     def __init__(
         self,
         dim,
@@ -299,31 +312,88 @@ class Attention(nn.Module):
         is_causal=False,
     ):
         super().__init__()
-        assert dim % num_heads == 0, "Embedding dimension must be divisible by number of heads."
+        
+        assert dim % num_heads == 0, "dim must be divisible by num_heads"
+        
+        self.dim = dim
         self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        
+        # Linear projections for Q, K, V
         self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
         self.attn_drop_prob = attn_drop
         self.attn_drop = nn.Dropout(attn_drop)
         self.proj = nn.Linear(dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
+
         self.is_causal = is_causal
+        
+        # Learnable bias for each frequency component
+        self.pope_bias = nn.Parameter(torch.zeros(self.head_dim))
 
-    def forward(self, x, attn_mask=None):
+    
+    def forward(self, x, freqs, attn_mask=None):
+        """
+        Forward pass
+        
+        Args:
+            x: Input tensor (batch_size, seq_len, d_model)
+            freqs: Frequency components for PoPE encoding, tuple of tensors with shape (2, seq_len, head_dim)
+            attn_mask: Optional attention mask (batch_size, seq_len, seq_len) or (batch_size, 1, seq_len, seq_len)
+        Returns:
+            Output tensor (batch_size, seq_len, d_model)
+        """
         B, N, C = x.shape
-        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
+
+        # Project to Q, K, V
+        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]  # [B, num_heads, N, D]
+        
+        # Apply PoPE encoding to Q and K
+        q_real, q_imag = rotate_queries_or_keys(q, freqs=freqs)
+        k_real, k_imag = rotate_queries_or_keys(k, freqs=freqs)
 
-        x = F.scaled_dot_product_attention(
-            q, k, v,
-            attn_mask=attn_mask,
-            dropout_p=(self.attn_drop_prob if self.training else 0.0),
-            is_causal=self.is_causal,
-        )
+        # Apply bias to K phases (separate bias for each dimension)
+        k_real, k_imag = apply_bias_to_keys(k_real, k_imag, self.pope_bias)
 
-        x = x.transpose(1, 2).reshape(B, N, C)
-        x = self.proj(x)
-        x = self.proj_drop(x)
-        return x
+        # slower to compute with einsum
+        # scores = (
+        #     torch.einsum('bhqd,bhkd->bhqk', q_real, k_real) +
+        #     torch.einsum('bhqd,bhkd->bhqk', q_imag, k_imag)
+        # )
+        
+        # Compute attention scores
+        q_combined = torch.cat([q_real, q_imag], dim=-1) # Shape: (b, h, q, 2d)
+        k_combined = torch.cat([k_real, k_imag], dim=-1) # Shape: (b, h, k, 2d)
+        scores = torch.matmul(q_combined, k_combined.transpose(-1, -2))
+
+        scores = scores / math.sqrt(self.head_dim)
+
+        # Apply custom mask if provided
+        if attn_mask is not None:
+            if attn_mask.dim() == 3:
+                attn_mask = attn_mask.unsqueeze(1)  # (B, 1, N, N)
+            # Support both boolean masks and float masks
+            if attn_mask.dtype == torch.bool:
+                scores = scores.masked_fill(~attn_mask, float('-inf'))
+            else:
+                scores = scores.masked_fill(attn_mask == 0, float('-inf'))
+        
+        # Apply softmax
+        attn = F.softmax(scores, dim=-1)
+        attn = self.attn_drop(attn)
+        
+        # Compute output
+        output = torch.matmul(attn, v)  # (batch, num_heads, seq_len, head_dim)
+        
+        # Concatenate heads and reshape
+        output = output.transpose(1, 2).contiguous().view(B, N, self.dim)
+        
+        # Final projection
+        output = self.proj(output)
+        output = self.proj_drop(output)
+        
+        return output
     
 
 
@@ -345,7 +415,7 @@ class AttentionBlock(nn.Module):
     ):
         super().__init__()
         self.norm1 = norm_layer(dim)
-        self.attn = Attention(
+        self.attn = PoPEAttention(
             dim,
             num_heads=num_heads,
             qkv_bias=qkv_bias,
@@ -364,8 +434,8 @@ class AttentionBlock(nn.Module):
         else:
             self.mlp = MLP(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop)
 
-    def forward(self, x, attn_mask=None):
-        y = self.attn(self.norm1(x), attn_mask=attn_mask)
+    def forward(self, x, freqs, attn_mask=None):
+        y = self.attn(self.norm1(x), freqs=freqs, attn_mask=attn_mask)
         x = x + self.drop_path(y)
         x = x + self.drop_path(self.mlp(self.norm2(x)))
         return x
