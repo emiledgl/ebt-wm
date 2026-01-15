@@ -168,11 +168,9 @@ class LightningWM(pl.LightningModule):
         # Reconstruction loss (SmoothL1)
         recon_loss = F.smooth_l1_loss(pred_embeds, target_embeds)
         # SIGReg loss
-        #sigreg_loss = self.sigreg(proj)
+        sigreg_loss = self.sigreg(proj)
         # Total loss
-        #total_loss = self.lambd * sigreg_loss + (1 - self.lambd) * recon_loss
-        total_loss = recon_loss
-        sigreg_loss = torch.tensor(0.0, device=total_loss.device)
+        total_loss = self.lambd * sigreg_loss + (1 - self.lambd) * recon_loss
         
         return {
             'loss': total_loss,
