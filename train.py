@@ -28,6 +28,7 @@ def parse_args():
     parser.add_argument("--image_size", type=int, default=256, help="Input image size")
     parser.add_argument("--tubelet_size", type=int, default=2, help="Tubelet size")
     parser.add_argument("--image_backbone", type=str, default="resnet50", help="Image backbone model")
+    parser.add_argument("--pretrained", action="store_true", default=False, help="Use pretrained image backbone")
     parser.add_argument("--proprio_dim", type=int, default=8, help="Proprioception dimension")
     parser.add_argument("--emb_dim", type=int, default=768, help="Embedding dimension")
     parser.add_argument("--num_queries", type=int, default=64, help="Number of query tokens")
@@ -159,7 +160,9 @@ def main():
         # State Encoder params
         image_size=(args.image_size, args.image_size),
         tubelet_size=args.tubelet_size,
+        num_views=len(args.camera_keys),
         image_backbone=args.image_backbone,
+        pretrained=args.pretrained,
         proprio_dim=args.proprio_dim,
         emb_dim=args.emb_dim,
         num_queries=args.num_queries,

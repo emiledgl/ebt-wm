@@ -66,6 +66,40 @@ def apply_bias_to_keys(k_real, k_imag, bias):
 
 
 
+def create_fourier_pos(grid_size: tuple[int, ...], head_dim: int) -> torch.Tensor:
+        """
+        Create N-Dimensional Fourier positional embeddings.
+        """
+        n_dims = len(grid_size)
+        
+        assert head_dim % (2 * n_dims) == 0, \
+            f"Embedding dimension {head_dim} must be divisible by {2 * n_dims} for {n_dims}D Fourier features."
+        
+        # Number of frequencies per dimension
+        num_freqs = head_dim // (2 * n_dims)
+
+        # Create normalized grids for each dimension from -1 to 1
+        axis_grids = [torch.linspace(-1, 1, steps=s) for s in grid_size]
+        grid_tensors = torch.meshgrid(*axis_grids, indexing='ij')
+        stacked = torch.stack(grid_tensors, dim=-1).reshape(-1, n_dims) # (seq_len, N)
+        
+        # Generate frequency bands
+        freq_bands = torch.exp(
+            torch.arange(0, num_freqs).float() * -(math.log(10000.0) / num_freqs) # (num_freqs,)
+        )
+        
+        # Apply frequencies to positions
+        args = stacked.unsqueeze(-1) * freq_bands # (seq_len, N, num_freqs)
+        
+        # Apply sin and cos and concatenate
+        pos_sin, pos_cos = torch.sin(args), torch.cos(args) # (seq_len, N, num_freqs)
+        pos = torch.cat([pos_sin, pos_cos], dim=-1) # (seq_len, N, head_dim//N)
+        pos = pos.reshape(-1, head_dim) # (seq_len, head_dim)
+        
+        return pos
+
+
+
 def build_action_block_causal_attention_mask(T, K, action_tokens=1):
     N_T =  K + action_tokens
     N = T * N_T
@@ -214,7 +248,7 @@ class PoPE2DAttention(nn.Module):
         q_combined = torch.cat([q_real, q_imag], dim=-1) # Shape: (b, h, q, 2d)
         k_combined = torch.cat([k_real, k_imag], dim=-1) # Shape: (b, h, k, 2d)
         scores = torch.matmul(q_combined, k_combined.transpose(-1, -2))
-        
+
         scores = scores / math.sqrt(self.head_dim)
 
         # Apply custom mask if provided

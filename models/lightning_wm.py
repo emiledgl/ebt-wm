@@ -14,11 +14,12 @@ class LightningWM(pl.LightningModule):
         # State Encoder params
         image_size: tuple[int, int] = (256, 256),
         tubelet_size: int = 2,
+        num_views: int = 1,
         image_backbone: str = "resnet50",
         pretrained: bool = False,
+        num_queries: int = 64,
         proprio_dim: int = 8,
         emb_dim: int = 768,
-        num_queries: int = 64,
         num_heads_encoder: int = 12,
         encoder_depth: int = 4,
         num_cross_blocks_per_layer: int = 3,
@@ -55,11 +56,12 @@ class LightningWM(pl.LightningModule):
         self.state_encoder = StateEncoder(
             image_size=image_size,
             tubelet_size=tubelet_size,
+            num_views=num_views,
             image_backbone=image_backbone,
             pretrained=pretrained,
+            num_queries=num_queries,
             proprio_dim=proprio_dim,
             emb_dim=emb_dim,
-            num_queries=num_queries,
             num_heads=num_heads_encoder,
             depth=encoder_depth,
             num_cross_blocks_per_layer=num_cross_blocks_per_layer,
@@ -111,7 +113,7 @@ class LightningWM(pl.LightningModule):
         Forward pass for autoregressive state prediction.
         
         Args:
-            video: (B, T, C, H, W) video tensor
+            video: (B, T, V, C, H, W) video tensor
             proprios: (B, T, proprio_dim) proprioception tensor
             actions: (B, N, A) action tensor
             
@@ -119,19 +121,19 @@ class LightningWM(pl.LightningModule):
             Dictionary with predictions and targets
         """
         # Encode all states with online encoder
-        B, _, C, H, W = video.shape
+        B, _, V, C, H, W = video.shape
         N = actions.size(1) # Number of prediction steps
         K = self.state_encoder.num_queries
         tubelet_size = self.state_encoder.tubelet_size
         
-        input_video = video[:, :-tubelet_size] # (B, N*tubelet_size, C, H, W)
-        target_video = video[:, tubelet_size:] # (B, N*tubelet_size, C, H, W)
+        input_video = video[:, :-tubelet_size] # (B, N*tubelet_size, V, C, H, W)
+        target_video = video[:, tubelet_size:] # (B, N*tubelet_size, V, C, H, W)
         input_proprios = proprios[:, :-tubelet_size] # (B, N*tubelet_size, P)
         target_proprios = proprios[:, tubelet_size:] # (B, N*tubelet_size, P)
 
-        input_video = input_video.reshape(B * N, tubelet_size, C, H, W)  # (B*N, tubelet_size, C, H, W)
+        input_video = input_video.reshape(B * N, tubelet_size, V, C, H, W)  # (B*N, tubelet_size, V, C, H, W)
         input_proprios = input_proprios.reshape(B * N, tubelet_size, proprios.size(-1))  # (B*N, tubelet_size, P)
-        target_video = target_video.reshape(B * N, tubelet_size, C, H, W)  # (B*N, tubelet_size, C, H, W)
+        target_video = target_video.reshape(B * N, tubelet_size, V, C, H, W)  # (B*N, tubelet_size, V, C, H, W)
         target_proprios = target_proprios.reshape(B * N, tubelet_size, proprios.size(-1))  # (B*N, tubelet_size, P)
 
         # Encode input

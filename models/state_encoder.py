@@ -4,7 +4,7 @@ import math
 
 from models.derf import Dynamic_erf
 from models.modules import AttentionBlock, CrossAttentionBlock
-from models.modules import precompute_freqs
+from models.modules import create_fourier_pos, precompute_freqs
 from timm.layers import trunc_normal_
 from timm import create_model
 
@@ -17,11 +17,12 @@ class StateEncoder(nn.Module):
         self,
         image_size: tuple[int, int] = (256, 256),
         tubelet_size: int = 2,
+        num_views: int = 1,
         image_backbone: str = "resnet50", # supported by timm
         pretrained: bool = False,
+        num_queries: int = 64,
         proprio_dim: int = 8,
         emb_dim: int = 768,
-        num_queries: int = 64,
         num_heads: int = 12,
         depth: int = 2,
         num_cross_blocks_per_layer: int = 3,
@@ -43,6 +44,7 @@ class StateEncoder(nn.Module):
         self.proprio_dim = proprio_dim
         self.emb_dim = emb_dim
         self.num_queries = num_queries
+        self.num_views = num_views
 
         self.image_encoder = create_model(
             model_name=image_backbone,
@@ -61,6 +63,9 @@ class StateEncoder(nn.Module):
         # Project inputs to common embedding dimension
         self.image_proj = nn.Linear(self.image_emb_dim, emb_dim)
         self.proprio_proj = nn.Linear(proprio_dim, emb_dim)
+
+        self.image_modality = nn.Parameter(torch.zeros(1, 1, emb_dim))
+        self.proprio_modality = nn.Parameter(torch.zeros(1, 1, emb_dim))
 
         norm_layer = Dynamic_erf if use_derf else nn.RMSNorm
         
@@ -86,11 +91,14 @@ class StateEncoder(nn.Module):
         self.final_norm = norm_layer(emb_dim)
 
         # Positional embeddings
-        self.register_buffer('patch_pos_embed', self._create_3d_fourier_pos(emb_dim)) # (T*H*W, emb_dim)
-        self.register_buffer('proprio_pos_embed', self._create_1d_temporal_pos(emb_dim)) # (T, emb_dim)
+        grid_size = self.grid_size if self.num_views >= 1 else (self.tubelet_size, self.grid_size[2], self.grid_size[3])
+        self.register_buffer('patch_pos_embed', create_fourier_pos(grid_size, emb_dim)) # (T*V*H*W, emb_dim)
+        self.register_buffer('proprio_pos_embed', create_fourier_pos((self.tubelet_size,), emb_dim)) # (T, emb_dim)
         
         self.init_std = init_std
         trunc_normal_(self.query_tokens, std=self.init_std)
+        trunc_normal_(self.image_modality, std=self.init_std)
+        trunc_normal_(self.proprio_modality, std=self.init_std)
         self.apply(self._init_weights)
         self._rescale_blocks()
 
@@ -104,62 +112,7 @@ class StateEncoder(nn.Module):
         # Extract shapes
         channels = output.shape[1]
         grid_h, grid_w = output.shape[2], output.shape[3]
-        
-        return channels, (self.tubelet_size, grid_h, grid_w)
-    
-    
-    def _create_3d_fourier_pos(self, dim: int) -> torch.Tensor:
-        """Create 3D Fourier positional embeddings."""
-
-        t, h, w = self.grid_size
-        assert dim % 6 == 0, "Embedding dimension must be divisible by 6 for 3D Fourier features."
-        num_freqs = dim // 6  # since we have sin and cos for each of x, y, t
-
-        # Create normalized 3D grid from -1 to 1
-        t_grid, y_grid, x_grid = torch.meshgrid(
-            torch.linspace(-1, 1, t), 
-            torch.linspace(-1, 1, h), 
-            torch.linspace(-1, 1, w), 
-            indexing='ij'
-        )
-        stacked = torch.stack([t_grid, y_grid, x_grid], dim=-1).view(-1, 3)  # (T*H*W, 3)
-        
-        # Generate frequencies
-        freqs = torch.exp(
-            torch.arange(0, num_freqs).float() * -(math.log(10000.0) / num_freqs)
-        )
-        
-        # Apply frequencies to positions
-        args = stacked.unsqueeze(-1) * freqs  # (T*H*W, 3, dim/6)
-        
-        # Apply sin and cos
-        pos = torch.cat([torch.sin(args), torch.cos(args)], dim=-1)  # (T*H*W, 3, dim/3)
-        pos = pos.view(t * h * w, dim)  # (T*H*W, dim)
-        
-        return pos
-    
-
-    def _create_1d_temporal_pos(self, dim: int) -> torch.Tensor:
-        """Create 1D temporal positional embeddings for proprioception."""
-        t = self.tubelet_size
-        assert dim % 2 == 0, "Embedding dimension must be divisible by 2 for 1D Fourier features."
-        num_freqs = dim // 2
-        
-        # Create normalized temporal positions from -1 to 1
-        positions = torch.linspace(-1, 1, t).unsqueeze(-1)  # (T, 1)
-        
-        # Generate frequencies
-        freqs = torch.exp(
-            torch.arange(0, num_freqs).float() * -(math.log(10000.0) / num_freqs)
-        )
-        
-        # Apply frequencies
-        args = positions * freqs  # (T, num_freqs)
-        
-        # Apply sin and cos
-        pos = torch.cat([torch.sin(args), torch.cos(args)], dim=-1)  # (T, dim)
-        
-        return pos
+        return channels, (self.tubelet_size, self.num_views, grid_h, grid_w)
 
     
     def _rescale_blocks(self):
@@ -192,34 +145,39 @@ class StateEncoder(nn.Module):
         Forward pass.
         
         Args:
-            images: Observation images of shape (B, tubelet_size, 3, H, W)
+            images: Observation images of shape (B, tubelet_size, V, 3, H, W)
             proprios: Proprioception embeddings of shape (B, tubelet_size, proprio_emb_dim)
             
         Returns:
             Query latents of shape (B, K, emb_dim)
         """
-        B, tubelet_size, _, H, W = images.shape
-        # Encode images
-        images = images.view(B * tubelet_size, 3, H, W)  # (B*tubelet_size, 3, H, W)
-        img_emb = self.image_encoder(images)[0]  # (B*tubelet_size, C, H', W')
-        C, H_enc, W_enc = img_emb.shape[1:]
-        assert (tubelet_size, H_enc, W_enc) == self.grid_size, "Encoded image size does not match expected grid size."
+        B, tubelet_size, V, _, H, W = images.shape
 
-        img_emb = img_emb.view(B, tubelet_size, C, H_enc, W_enc).permute(0, 1, 3, 4, 2)  # (B, tubelet_size, H', W', C)
-        img_emb = img_emb.reshape(B, tubelet_size * H_enc * W_enc, C)  # (B, tubelet_size*H'*W', C)
+        # Encode images
+        images = images.view(B * tubelet_size * V, 3, H, W)  # (B*tubelet_size*V, 3, H, W)
+        img_emb = self.image_encoder(images)[0]  # (B*tubelet_size*V, C, H', W')
+        C, H_enc, W_enc = img_emb.shape[-3:]
+        assert (tubelet_size, V, H_enc, W_enc) == self.grid_size, "Encoded image size does not match expected grid size."
+
+        img_emb = img_emb.view(B * tubelet_size * V, C, H_enc, W_enc).permute(0, 2, 3, 1)  # (B*tubelet_size*V, H', W', C)
+        img_emb = img_emb.reshape(B, tubelet_size * V * H_enc * W_enc, C)  # (B, tubelet_size*V*H'*W', C)
         
         # Project inputs to common dimension
-        x = self.image_proj(img_emb)  # (B, tubelet_size*H'*W', emb_dim)
+        x = self.image_proj(img_emb)  # (B, tubelet_size*V*H'*W', emb_dim)
         p = self.proprio_proj(proprios)  # (B, tubelet_size, emb_dim)
         
         # Add positional embeddings
         x = x + self.patch_pos_embed.unsqueeze(0)
         p = p + self.proprio_pos_embed.unsqueeze(0)
+
+        # Add modality embeddings
+        x = x + self.image_modality
+        p = p + self.proprio_modality
         
         # Concatenate observation and proprioception tokens
-        x = x.view(B, tubelet_size, H_enc * W_enc, -1)  # (B, tubelet_size, H'*W', emb_dim)
+        x = x.view(B, tubelet_size, V * H_enc * W_enc, -1)  # (B, tubelet_size, V*H'*W', emb_dim)
         p = p.unsqueeze(2)  # (B, tubelet_size, 1, emb_dim)
-        c = torch.cat([x, p], dim=2).flatten(1, 2)  # (B, tubelet_size*(H'*W'+1), emb_dim)
+        c = torch.cat([x, p], dim=2).flatten(1, 2)  # (B, tubelet_size*(V*H'*W'+1), emb_dim)
         
         # Expand query tokens for batch
         queries = self.query_tokens.unsqueeze(0).expand(B, -1, -1)  # (B, K, emb_dim)
