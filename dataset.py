@@ -13,7 +13,7 @@ class DROIDDataset(torch.utils.data.Dataset):
         tubelets_per_clip=8,
         image_size=256,
         tubelet_size=2,
-        camera_keys=["observation.images.wrist_left"],
+        camera_keys=None,
         normalize=False,
         video_backend="torchcodec",
     ):
@@ -66,8 +66,11 @@ class DROIDDataset(torch.utils.data.Dataset):
         data = self.dataset[index]
         
         # Randomly select a camera
-        camera_key = self.camera_keys[torch.randint(0, len(self.camera_keys), (1,)).item()]
-        video = data[camera_key] # [N*tubelet_size, C, H, W]
+        video = []
+        for camera_key in self.camera_keys:
+            video_view = data[camera_key]
+            video.append(video_view)
+        video = torch.stack(video, dim=1) # [N*tubelet_size, V, C, H, W]
         proprios = data["observation.state"] # [N*tubelet_size, P]
 
         # Extract Actions [N-1, A]
@@ -75,7 +78,7 @@ class DROIDDataset(torch.utils.data.Dataset):
         actions = data["action"][action_indices]
 
         if self.normalize:
-            video = self._normalize(video, camera_key)
+            video = self._normalize(video, self.camera_keys[0])
             proprios = self._normalize(proprios, "observation.state")
             actions = self._normalize(actions, "action")
 
@@ -88,7 +91,7 @@ if __name__ == "__main__":
         image_size=256,
         tubelet_size=2,
         num_episodes=100,
-        camera_keys=["observation.images.wrist_left"],
+        camera_keys=None,
         normalize=True,
         video_backend="pyav",
     )
